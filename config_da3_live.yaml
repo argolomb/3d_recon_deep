@@ -1,0 +1,51 @@
+#ip: 192.168.15.3:8080/video
+video: VID_20260502_172226.mp4
+model_backend: da3
+checkpoint: ./models/DA3-LARGE-1.1
+use_gpu: true
+
+rotate: none
+wb: clahe
+clahe_clip: 5.5
+clahe_tile: 8
+contrast: 1.12
+brightness: 4
+saturation: 1.08
+gamma: 0.9
+sharpen: 0.35
+denoise: 3
+low_latency: true
+
+input_size: 448
+resolution_scale: 1.0
+depth_output_scale: 1.0
+da3_process_res_method: upper_bound_resize
+pointcloud_compute_device: cuda
+
+display_scale: 0.75
+display_every: 1
+fast_vis: true
+fps_limit: 0
+print_every: 30
+profile_interval: 5
+cuda_empty_cache_every: 20
+
+live_registration: false
+registration_backend: robust
+registration_pose_icp_refine: true
+registration_every: 3
+registration_depth_scale: 1.0
+registration_stride: 2
+registration_voxel: 0.15
+registration_feature_radius: 0.05
+registration_ransac_distance: 0.08
+registration_icp_distance: 0.04
+registration_icp_fine_distance: 0.018
+registration_min_fitness: 0.08
+registration_max_rmse: 0.03
+registration_map_voxel: 0.01
+registration_max_points: 80000
+registration_max_map_points: 1000000
+teaser_noise_bound: 0.04
+teaser_max_correspondences: 5000
+teaser_mutual_filter: true

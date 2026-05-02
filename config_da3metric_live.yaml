@@ -1,0 +1,41 @@
+ip: 192.168.15.3:8080/video
+#video: VID_20260502_172226.mp4
+
+model_backend: da3
+checkpoint: ./models/DA3METRIC-LARGE
+use_gpu: true
+
+rotate: none
+wb: clahe
+clahe_clip: 3.5
+clahe_tile: 8
+contrast: 1.12
+brightness: 4
+saturation: 1.08
+gamma: 0.9
+sharpen: 0.35
+denoise: 3
+low_latency: true
+
+input_size: 384
+resolution_scale: 1.0
+depth_output_scale: 1.0
+da3_process_res_method: upper_bound_resize
+da3_metric_focal_scale: false
+da3_metric_scale: 1.0
+pointcloud_compute_device: cuda
+
+display_scale: 0.75
+display_every: 1
+fast_vis: false
+fps_limit: 0
+print_every: 30
+profile_interval: 5
+cuda_empty_cache_every: 20
+
+pointcloud: true
+pointcloud_stride: 6
+pointcloud_max_depth: 30
+
+live_registration: false
+max_depth: 80

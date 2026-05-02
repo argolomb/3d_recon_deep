@@ -1,0 +1,80 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Local tool/cache state
+.cache/
+.tmp/
+.DS_Store
+Thumbs.db
+
+# Large model/checkpoint files and downloaded model snapshots
+models/
+model/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+
+# External repositories cloned locally
+Depth-Anything-V2/
+depth-anything-3/
+TEASER-plusplus/
+
+# Input recordings and archives
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+spectacular-rec/
+specular-rec/
+
+# Generated depth/RGB/SLAM logs
+slam_log/
+rgb/
+depth/
+depth_mm/
+
+# Generated point clouds, meshes, and reconstruction outputs
+pointclouds/
+fusion_out/
+da3_large_fusion/
+da3_gs_out/
+*_fusion/
+*_out/
+*.ply
+*.pcd
+*.glb
+*.obj
+*.stl
+
+# Numpy/export artifacts
+*.npy
+*.npz
+trajectory*.txt
+metadata.json
+
+# OpenCV/DA3 extracted frames and generated videos
+input_frames/
+gs_ply/
+gs_video/
+
