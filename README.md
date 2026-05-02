@@ -172,6 +172,22 @@ port: 8080
 stream_path: /video
 ```
 
+## WebSocket Input
+
+`main.py` also accepts image frames from `ws://` or `wss://` sources through the same `ip` field:
+
+```bash
+.venv/bin/python main.py --ip ws://192.168.15.2:8765/video --config config_da3_live.yaml
+```
+
+or in YAML:
+
+```yaml
+ip: ws://192.168.15.2:8765/video
+```
+
+The WebSocket server should send each RGB frame as a JPEG/PNG image. Supported payloads are binary JPEG/PNG frames, text base64, data URLs such as `data:image/jpeg;base64,...`, or JSON text with an `image`, `frame`, or `data` field containing base64 image data.
+
 ## YAML Configuration
 
 `main.py` accepts:

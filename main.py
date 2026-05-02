@@ -25,15 +25,21 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
+import hashlib
 import json
 import os
+import socket
+import ssl
+import struct
 import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -190,7 +196,7 @@ def add_config_argument(parser: argparse.ArgumentParser) -> Optional[str]:
 def parse_args() -> RuntimeConfig:
     parser = argparse.ArgumentParser(description="Real-time metric depth with Depth Anything and Android IP Webcam.")
     config_path = add_config_argument(parser)
-    parser.add_argument("--ip", default=None, help="Android IP Webcam address, for example 192.168.0.10")
+    parser.add_argument("--ip", default=None, help="Android IP Webcam address or WebSocket URL, for example 192.168.0.10 or ws://host:port/path")
     parser.add_argument("--video", default=None, help="Local video file. Example: ./spectacular-rec/data.mp4")
     parser.add_argument("--loop_video", action="store_true", help="Loop local video at EOF.")
     parser.add_argument("--realtime_video", action="store_true", help="Throttle local video playback to the file FPS.")
@@ -375,7 +381,7 @@ def parse_args() -> RuntimeConfig:
 
 
 def stream_url(cfg: RuntimeConfig) -> str:
-    if cfg.ip.startswith(("http://", "https://")):
+    if cfg.ip.startswith(("http://", "https://", "ws://", "wss://")):
         return cfg.ip
     if "/" in cfg.ip:
         return f"http://{cfg.ip}"
@@ -386,8 +392,14 @@ def stream_url(cfg: RuntimeConfig) -> str:
     return f"http://{cfg.ip}:{cfg.port}{path}"
 
 
+def is_websocket_source(cfg: RuntimeConfig) -> bool:
+    return bool(not cfg.video and stream_url(cfg).startswith(("ws://", "wss://")))
+
+
 def open_stream(cfg: RuntimeConfig) -> cv2.VideoCapture:
     source = cfg.video if cfg.video else stream_url(cfg)
+    if source.startswith(("ws://", "wss://")):
+        raise ValueError("WebSocket sources are handled by WebSocketFrameStream, not cv2.VideoCapture")
     cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
     if cfg.width > 0:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.width)
@@ -513,6 +525,214 @@ class LatestFrameStream:
         self.stopped = True
         self.thread.join(timeout=1.0)
         self.cap.release()
+
+
+class WebSocketImageClient:
+    """Minimal RFC6455 image receiver for binary JPEG/PNG or base64 text frames."""
+
+    GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, url: str, timeout: float = 5.0) -> None:
+        self.url = url
+        self.timeout = timeout
+        self.sock: Optional[socket.socket] = None
+
+    def connect(self) -> None:
+        parsed = urlparse(self.url)
+        if parsed.scheme not in ("ws", "wss"):
+            raise ValueError(f"Unsupported WebSocket scheme: {parsed.scheme}")
+        host = parsed.hostname
+        if not host:
+            raise ValueError(f"Invalid WebSocket URL: {self.url}")
+        port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        raw_sock = socket.create_connection((host, port), timeout=self.timeout)
+        if parsed.scheme == "wss":
+            raw_sock = ssl.create_default_context().wrap_socket(raw_sock, server_hostname=host)
+        raw_sock.settimeout(self.timeout)
+
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        host_header = host if parsed.port is None else f"{host}:{port}"
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host_header}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        raw_sock.sendall(request.encode("ascii"))
+        response = self._recv_until(raw_sock, b"\r\n\r\n", max_bytes=16384).decode("iso-8859-1", errors="replace")
+        status = response.split("\r\n", 1)[0]
+        if " 101 " not in f" {status} ":
+            raw_sock.close()
+            raise ConnectionError(f"WebSocket handshake failed: {status}")
+
+        headers = {}
+        for line in response.split("\r\n")[1:]:
+            if ":" in line:
+                name, value = line.split(":", 1)
+                headers[name.strip().lower()] = value.strip()
+        expected = base64.b64encode(hashlib.sha1((key + self.GUID).encode("ascii")).digest()).decode("ascii")
+        if headers.get("sec-websocket-accept") != expected:
+            raw_sock.close()
+            raise ConnectionError("WebSocket handshake failed: invalid Sec-WebSocket-Accept")
+        self.sock = raw_sock
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    @staticmethod
+    def _recv_until(sock_obj: socket.socket, marker: bytes, max_bytes: int) -> bytes:
+        data = bytearray()
+        while marker not in data:
+            chunk = sock_obj.recv(1)
+            if not chunk:
+                raise ConnectionError("socket closed during handshake")
+            data.extend(chunk)
+            if len(data) > max_bytes:
+                raise ConnectionError("handshake response too large")
+        return bytes(data)
+
+    def _recv_exact(self, size: int) -> bytes:
+        if self.sock is None:
+            raise ConnectionError("WebSocket is not connected")
+        data = bytearray()
+        while len(data) < size:
+            chunk = self.sock.recv(size - len(data))
+            if not chunk:
+                raise ConnectionError("WebSocket closed")
+            data.extend(chunk)
+        return bytes(data)
+
+    def _send_control(self, opcode: int, payload: bytes = b"") -> None:
+        if self.sock is None:
+            return
+        payload = payload[:125]
+        mask = os.urandom(4)
+        header = bytes((0x80 | opcode, 0x80 | len(payload)))
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self.sock.sendall(header + mask + masked)
+
+    def recv_image(self) -> np.ndarray:
+        fragments = []
+        first_opcode = None
+        while True:
+            header = self._recv_exact(2)
+            first_byte, second_byte = header
+            fin = bool(first_byte & 0x80)
+            opcode = first_byte & 0x0F
+            masked = bool(second_byte & 0x80)
+            payload_len = second_byte & 0x7F
+            if payload_len == 126:
+                payload_len = struct.unpack("!H", self._recv_exact(2))[0]
+            elif payload_len == 127:
+                payload_len = struct.unpack("!Q", self._recv_exact(8))[0]
+
+            mask_key = self._recv_exact(4) if masked else b""
+            payload = self._recv_exact(payload_len) if payload_len else b""
+            if masked:
+                payload = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+
+            if opcode == 8:
+                raise ConnectionError("WebSocket close frame received")
+            if opcode == 9:
+                self._send_control(10, payload)
+                continue
+            if opcode == 10:
+                continue
+            if opcode in (1, 2):
+                first_opcode = opcode
+                fragments = [payload]
+            elif opcode == 0 and first_opcode is not None:
+                fragments.append(payload)
+            else:
+                continue
+
+            if fin:
+                return decode_websocket_image(b"".join(fragments), first_opcode)
+
+
+def decode_websocket_image(payload: bytes, opcode: int) -> np.ndarray:
+    if opcode == 1:
+        text = payload.decode("utf-8", errors="ignore").strip()
+        if text.startswith("{"):
+            try:
+                data = json.loads(text)
+                for key in ("image", "frame", "data"):
+                    if key in data:
+                        text = str(data[key]).strip()
+                        break
+            except json.JSONDecodeError:
+                pass
+        if "," in text and text.lower().startswith("data:image"):
+            text = text.split(",", 1)[1]
+        payload = base64.b64decode(text, validate=False)
+
+    image_bytes = np.frombuffer(payload, dtype=np.uint8)
+    frame_bgr = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
+    if frame_bgr is None:
+        raise ValueError("WebSocket payload is not a valid JPEG/PNG image")
+    return frame_bgr
+
+
+class WebSocketFrameStream:
+    def __init__(self, cfg: RuntimeConfig) -> None:
+        self.cfg = cfg
+        self.url = stream_url(cfg)
+        self.lock = threading.Lock()
+        self.frame = None
+        self.stopped = False
+        self.client: Optional[WebSocketImageClient] = None
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def _reader(self) -> None:
+        min_dt = 1.0 / self.cfg.capture_fps if self.cfg.capture_fps > 0 else 0.0
+        while not self.stopped:
+            try:
+                if self.client is None:
+                    print(f"[ws] connecting {self.url}")
+                    self.client = WebSocketImageClient(self.url)
+                    self.client.connect()
+                    print("[ws] connected")
+                start = time.perf_counter()
+                frame_bgr = self.client.recv_image()
+                frame_bgr = preprocess_frame(frame_bgr, self.cfg)
+                with self.lock:
+                    self.frame = frame_bgr
+                if min_dt > 0:
+                    elapsed = time.perf_counter() - start
+                    if elapsed < min_dt:
+                        time.sleep(min_dt - elapsed)
+            except Exception as exc:
+                if not self.stopped:
+                    print(f"[ws] connection lost ({exc}); reconnecting in {self.cfg.reconnect_delay:.1f}s")
+                    if self.client is not None:
+                        self.client.close()
+                        self.client = None
+                    time.sleep(self.cfg.reconnect_delay)
+
+    def read(self) -> Optional[np.ndarray]:
+        with self.lock:
+            if self.frame is None:
+                return None
+            return self.frame.copy()
+
+    def release(self) -> None:
+        self.stopped = True
+        if self.client is not None:
+            self.client.close()
+        self.thread.join(timeout=1.0)
 
 
 def _append_repo_path(repo_path: Optional[str]) -> None:
@@ -1574,8 +1794,14 @@ def main() -> int:
         print(f"[fatal] model load failed: {exc}", file=sys.stderr)
         return 2
 
-    cap = None if cfg.low_latency and not cfg.video else open_stream(cfg)
-    stream = LatestFrameStream(cfg) if cfg.low_latency and not cfg.video else None
+    ws_source = is_websocket_source(cfg)
+    cap = None if (ws_source or (cfg.low_latency and not cfg.video)) else open_stream(cfg)
+    if ws_source:
+        stream = WebSocketFrameStream(cfg)
+    elif cfg.low_latency and not cfg.video:
+        stream = LatestFrameStream(cfg)
+    else:
+        stream = None
     video_fps = cap.get(cv2.CAP_PROP_FPS) if cap is not None and cfg.video else 0.0
     create_display_window(cfg)
     viewer = None
