@@ -92,6 +92,10 @@ class RuntimeConfig:
     pointcloud_stride: int
     pointcloud_max_depth: float
     pointcloud_compute_device: str
+    dataset_save_dir: Optional[str]
+    dataset_save_every: int
+    dataset_save_stride: int
+    dataset_save_max_depth: float
     live_registration: bool
     registration_every: int
     registration_stride: int
@@ -240,6 +244,10 @@ def parse_args() -> RuntimeConfig:
     parser.add_argument("--pointcloud_stride", type=int, default=1, help="Point cloud pixel stride. 1 is dense, 2/4 are faster and smaller.")
     parser.add_argument("--pointcloud_max_depth", type=float, default=0.0, help="Optional max depth filter in meters for point clouds. 0 uses --max_depth.")
     parser.add_argument("--pointcloud_compute_device", choices=("auto", "cpu", "cuda"), default="auto", help="Compute depth-to-pointcloud projection on CUDA when possible.")
+    parser.add_argument("--dataset_save_dir", default=None, help="Save synchronized RGB, depth_mm, partial PLY and metadata for offline reconstruction.")
+    parser.add_argument("--dataset_save_every", type=int, default=0, help="Save dataset sample every N inferred frames. 0 disables automatic saving; press d to save.")
+    parser.add_argument("--dataset_save_stride", type=int, default=2, help="Point-cloud stride for dataset partial PLY.")
+    parser.add_argument("--dataset_save_max_depth", type=float, default=0.0, help="Optional max depth filter for dataset partial PLY. 0 uses pointcloud/max_depth.")
     parser.add_argument("--live_registration", action="store_true", help="Open a live preview map using Open3D RANSAC+ICP registration.")
     parser.add_argument("--registration_every", type=int, default=10, help="Submit one keyframe to live registration every N inferred frames.")
     parser.add_argument("--registration_stride", type=int, default=4, help="Pixel stride for live registration input. Higher is faster.")
@@ -330,6 +338,10 @@ def parse_args() -> RuntimeConfig:
         pointcloud_stride=max(args.pointcloud_stride, 1),
         pointcloud_max_depth=max(args.pointcloud_max_depth, 0.0),
         pointcloud_compute_device=args.pointcloud_compute_device,
+        dataset_save_dir=args.dataset_save_dir,
+        dataset_save_every=max(args.dataset_save_every, 0),
+        dataset_save_stride=max(args.dataset_save_stride, 1),
+        dataset_save_max_depth=max(args.dataset_save_max_depth, 0.0),
         live_registration=args.live_registration,
         registration_every=max(args.registration_every, 1),
         registration_stride=max(args.registration_stride, 1),
@@ -1009,6 +1021,110 @@ def save_pointcloud_ply(points: np.ndarray, colors_rgb: np.ndarray, save_dir: st
     print(f"\n[pointcloud] saved {path} ({len(vertices)} points)")
 
 
+def write_pointcloud_ply(points: np.ndarray, colors_rgb: np.ndarray, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    colors_u8 = np.clip(colors_rgb, 0, 255).astype(np.uint8)
+    vertices = np.empty(
+        points.shape[0],
+        dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("red", "u1"), ("green", "u1"), ("blue", "u1")],
+    )
+    vertices["x"] = points[:, 0].astype(np.float32)
+    vertices["y"] = points[:, 1].astype(np.float32)
+    vertices["z"] = points[:, 2].astype(np.float32)
+    vertices["red"] = colors_u8[:, 0]
+    vertices["green"] = colors_u8[:, 1]
+    vertices["blue"] = colors_u8[:, 2]
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"element vertex {len(vertices)}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        "end_header\n"
+    )
+    with path.open("wb") as handle:
+        handle.write(header.encode("ascii"))
+        vertices.tofile(handle)
+
+
+def pose_to_list(pose: Optional[np.ndarray]):
+    return None if pose is None else np.asarray(pose, dtype=float).tolist()
+
+
+def save_dataset_sample(
+    frame_bgr: np.ndarray,
+    depth_m: np.ndarray,
+    cfg: RuntimeConfig,
+    index: int,
+    frame_index: int,
+    infer_index: int,
+    pose_world_cam: Optional[np.ndarray],
+) -> None:
+    if not cfg.dataset_save_dir:
+        return
+    root = Path(cfg.dataset_save_dir)
+    stamp_ns = time.time_ns()
+    stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{stamp_ns % 1_000_000_000:09d}"
+    name = f"{index:06d}_{stamp}"
+
+    rgb_dir = root / "rgb"
+    depth_dir = root / "depth_mm"
+    ply_dir = root / "ply"
+    meta_dir = root / "meta"
+    for directory in (rgb_dir, depth_dir, ply_dir, meta_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    rgb_path = rgb_dir / f"{name}.png"
+    depth_path = depth_dir / f"{name}.png"
+    ply_path = ply_dir / f"{name}.ply"
+    meta_path = meta_dir / f"{name}.json"
+
+    depth_mm = np.clip(depth_m * 1000.0, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+    cv2.imwrite(str(rgb_path), frame_bgr)
+    cv2.imwrite(str(depth_path), depth_mm)
+
+    original_max_depth = cfg.pointcloud_max_depth
+    if cfg.dataset_save_max_depth > 0.0:
+        cfg.pointcloud_max_depth = cfg.dataset_save_max_depth
+    try:
+        points, colors = depth_to_pointcloud(frame_bgr, depth_m, cfg, stride=cfg.dataset_save_stride)
+    finally:
+        cfg.pointcloud_max_depth = original_max_depth
+    write_pointcloud_ply(points, colors, ply_path)
+
+    fx, fy, cx, cy = camera_intrinsics(frame_bgr.shape[1], frame_bgr.shape[0], cfg)
+    meta = {
+        "timestamp_ns": stamp_ns,
+        "timestamp_name": stamp,
+        "frame_index": frame_index,
+        "infer_index": infer_index,
+        "rgb": str(rgb_path.relative_to(root)),
+        "depth_mm": str(depth_path.relative_to(root)),
+        "ply": str(ply_path.relative_to(root)),
+        "depth_unit": "millimeters_uint16",
+        "pointcloud_stride": cfg.dataset_save_stride,
+        "pointcloud_points": int(len(points)),
+        "camera": {
+            "fx": float(fx),
+            "fy": float(fy),
+            "cx": float(cx),
+            "cy": float(cy),
+            "width": int(frame_bgr.shape[1]),
+            "height": int(frame_bgr.shape[0]),
+        },
+        "pose_world_cam": pose_to_list(pose_world_cam),
+        "model_backend": cfg.model_backend,
+        "checkpoint": cfg.checkpoint,
+    }
+    with meta_path.open("w", encoding="utf-8") as handle:
+        json.dump(meta, handle, indent=2)
+    print(f"\n[dataset] saved {name} points={len(points)}")
+
+
 class PointCloudViewer:
     def __init__(self) -> None:
         import open3d as o3d
@@ -1450,7 +1566,7 @@ def main() -> int:
     load_calibration_intrinsics(cfg)
     source_label = cfg.video if cfg.video else stream_url(cfg)
     print(f"[stream] opening {source_label}")
-    print("[keys] q/ESC quit | s save synchronized RGB+depth | p save dense point cloud")
+    print("[keys] q/ESC quit | s save RGB+depth | p save point cloud | d save dataset sample")
 
     try:
         model_handle = load_model(cfg)
@@ -1480,6 +1596,7 @@ def main() -> int:
     infer_index = 0
     saved_index = 0
     pointcloud_saved_index = 0
+    dataset_saved_index = 0
     last_depth = None
     last_pose_world_cam = None
     last_infer_error = 0.0
@@ -1564,11 +1681,18 @@ def main() -> int:
                 if points.size:
                     save_pointcloud_ply(points, colors, cfg.pointcloud_save_dir, pointcloud_saved_index)
                     pointcloud_saved_index += 1
+            if key == ord("d") and cfg.dataset_save_dir and last_depth is not None:
+                save_dataset_sample(frame_bgr, last_depth, cfg, dataset_saved_index, frame_index, infer_index, last_pose_world_cam)
+                dataset_saved_index += 1
 
             if cfg.save_dir and cfg.save_every > 0 and last_depth is not None and run_infer:
                 if infer_index % cfg.save_every == 0:
                     save_synchronized(frame_bgr, last_depth, cfg.save_dir, saved_index)
                     saved_index += 1
+            if cfg.dataset_save_dir and cfg.dataset_save_every > 0 and last_depth is not None and run_infer:
+                if infer_index % cfg.dataset_save_every == 0:
+                    save_dataset_sample(frame_bgr, last_depth, cfg, dataset_saved_index, frame_index, infer_index, last_pose_world_cam)
+                    dataset_saved_index += 1
             if cfg.pointcloud_save_dir and cfg.pointcloud_save_every > 0 and last_depth is not None and run_infer:
                 if infer_index % cfg.pointcloud_save_every == 0:
                     points, colors = depth_to_pointcloud(frame_bgr, last_depth, cfg, stride=cfg.pointcloud_stride)

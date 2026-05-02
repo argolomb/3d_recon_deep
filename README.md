@@ -485,6 +485,79 @@ Output:
 pointclouds/cloud_*.ply
 ```
 
+## Saving Reconstruction Dataset Samples
+
+For offline reconstruction, `main.py` can save a synchronized package containing:
+
+- RGB frame
+- depth PNG as `uint16` millimeters
+- partial point cloud as PLY
+- JSON metadata with timestamp, intrinsics and optional DA3 pose
+
+Enable automatic dataset capture:
+
+```yaml
+dataset_save_dir: ./dataset_capture
+dataset_save_every: 5
+dataset_save_stride: 4
+dataset_save_max_depth: 30
+```
+
+Or press `d` during live execution to save one sample manually.
+
+Output structure:
+
+```text
+dataset_capture/
+  rgb/
+    000000_YYYYMMDD_HHMMSS_xxxxxxxxx.png
+  depth_mm/
+    000000_YYYYMMDD_HHMMSS_xxxxxxxxx.png
+  ply/
+    000000_YYYYMMDD_HHMMSS_xxxxxxxxx.ply
+  meta/
+    000000_YYYYMMDD_HHMMSS_xxxxxxxxx.json
+```
+
+Metadata example:
+
+```json
+{
+  "timestamp_ns": 1760000000000000000,
+  "frame_index": 123,
+  "infer_index": 45,
+  "rgb": "rgb/000000_YYYYMMDD_HHMMSS_xxxxxxxxx.png",
+  "depth_mm": "depth_mm/000000_YYYYMMDD_HHMMSS_xxxxxxxxx.png",
+  "ply": "ply/000000_YYYYMMDD_HHMMSS_xxxxxxxxx.ply",
+  "depth_unit": "millimeters_uint16",
+  "pointcloud_stride": 4,
+  "pointcloud_points": 123456,
+  "camera": {
+    "fx": 1450.81,
+    "fy": 1450.81,
+    "cx": 719.0,
+    "cy": 960.0,
+    "width": 1440,
+    "height": 1920
+  },
+  "pose_world_cam": null,
+  "model_backend": "da3",
+  "checkpoint": "./models/DA3METRIC-LARGE"
+}
+```
+
+Use a larger stride for lighter logs:
+
+```yaml
+dataset_save_stride: 6
+```
+
+Use a smaller stride for denser partial clouds:
+
+```yaml
+dataset_save_stride: 1
+```
+
 ## Offline V2 Metric Fusion
 
 Use [offline_fusion.py](offline_fusion.py) for:
@@ -610,6 +683,7 @@ In `main.py`:
 q or ESC  quit
 s         save synchronized RGB + depth, if save_dir is set
 p         save current point cloud, if pointcloud_save_dir is set
+d         save synchronized RGB + depth + partial PLY + metadata, if dataset_save_dir is set
 ```
 
 ## Performance Tips
@@ -754,6 +828,7 @@ fusion_out/
 da3_large_fusion/
 da3_gs_out/
 pointclouds/
+dataset_capture/
 slam_log/
 __pycache__/
 ```

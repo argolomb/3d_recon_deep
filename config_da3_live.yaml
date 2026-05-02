@@ -30,6 +30,11 @@ print_every: 30
 profile_interval: 5
 cuda_empty_cache_every: 20
 
+dataset_save_dir: null
+dataset_save_every: 0
+dataset_save_stride: 4
+dataset_save_max_depth: 30
+
 live_registration: false
 registration_backend: robust
 registration_pose_icp_refine: true
