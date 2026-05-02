@@ -1,4 +1,4 @@
-# 3D_INDEX
+# 3D_RECON_DEEP
 
 Real-time and offline depth/point-cloud reconstruction experiments with Android IP Webcam, Depth Anything V2 Metric, Depth Anything 3 Large/Metric, Open3D, TEASER++, ICP, TSDF and optional 3D Gaussian Splatting export.
 
