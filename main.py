@@ -34,6 +34,7 @@ import socket
 import ssl
 import struct
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -528,7 +529,7 @@ class LatestFrameStream:
 
 
 class WebSocketImageClient:
-    """Minimal RFC6455 image receiver for binary JPEG/PNG or base64 text frames."""
+    """Minimal RFC6455 media receiver for binary JPEG/PNG/MP4 or base64 text frames."""
 
     GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -676,13 +677,34 @@ def decode_websocket_image(payload: bytes, opcode: int) -> np.ndarray:
                 pass
         if "," in text and text.lower().startswith("data:image"):
             text = text.split(",", 1)[1]
+        if "," in text and text.lower().startswith("data:video"):
+            text = text.split(",", 1)[1]
         payload = base64.b64decode(text, validate=False)
 
     image_bytes = np.frombuffer(payload, dtype=np.uint8)
     frame_bgr = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
-    if frame_bgr is None:
-        raise ValueError("WebSocket payload is not a valid JPEG/PNG image")
-    return frame_bgr
+    if frame_bgr is not None:
+        return frame_bgr
+    
+    # Try to decode as MP4 video
+    if len(payload) >= 8 and payload[4:8] == b"ftyp":
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
+            tmp_file.write(payload)
+            tmp_path = tmp_file.name
+        try:
+            cap = cv2.VideoCapture(tmp_path, cv2.CAP_FFMPEG)
+            ret, frame_bgr = cap.read()
+            cap.release()
+            os.unlink(tmp_path)
+            if ret and frame_bgr is not None:
+                return frame_bgr
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+    
+    raise ValueError("WebSocket payload is not a valid JPEG/PNG/MP4 media")
 
 
 class WebSocketFrameStream:

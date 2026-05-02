@@ -186,7 +186,7 @@ or in YAML:
 ip: ws://192.168.15.2:8765/video
 ```
 
-The WebSocket server should send each RGB frame as a JPEG/PNG image. Supported payloads are binary JPEG/PNG frames, text base64, data URLs such as `data:image/jpeg;base64,...`, or JSON text with an `image`, `frame`, or `data` field containing base64 image data.
+The WebSocket server should send each RGB frame as a JPEG/PNG image or MP4 video. Supported payloads are binary JPEG/PNG/MP4 frames, text base64, data URLs such as `data:image/jpeg;base64,...` or `data:video/mp4;base64,...`, or JSON text with an `image`, `frame`, or `data` field containing base64 image/video data. For MP4 videos, the first frame will be extracted.
 
 ## YAML Configuration
 
