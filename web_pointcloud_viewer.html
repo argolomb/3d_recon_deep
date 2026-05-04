@@ -21,9 +21,10 @@
       right: 12px;
       z-index: 2;
       display: flex;
+      flex-wrap: wrap;
       gap: 8px;
       align-items: center;
-      max-width: 760px;
+      max-width: 980px;
     }
     input, button {
       height: 34px;
@@ -46,6 +47,9 @@
       font-size: 13px;
       color: #aab4bc;
     }
+    .view-button {
+      min-width: 72px;
+    }
   </style>
   <script type="importmap">
     {
@@ -59,6 +63,11 @@
   <div id="toolbar">
     <input id="url" value="ws://127.0.0.1:8765" spellcheck="false">
     <button id="connect">Connect</button>
+    <button id="center" class="view-button">Center</button>
+    <button id="yaw-left" class="view-button">Yaw -90</button>
+    <button id="yaw-right" class="view-button">Yaw +90</button>
+    <button id="pitch-up" class="view-button">Pitch +90</button>
+    <button id="pitch-down" class="view-button">Pitch -90</button>
     <span id="status">disconnected</span>
   </div>
 
@@ -94,9 +103,73 @@
     let cloud = null;
     let socket = null;
     let frames = 0;
+    let autoCentered = false;
     let lastFpsAt = performance.now();
     const status = document.getElementById("status");
     const urlInput = document.getElementById("url");
+
+    function cloudBounds() {
+      if (!cloud || !cloud.geometry) {
+        return null;
+      }
+      cloud.geometry.computeBoundingSphere();
+      cloud.geometry.computeBoundingBox();
+      const sphere = cloud.geometry.boundingSphere;
+      const box = cloud.geometry.boundingBox;
+      if (!sphere || !Number.isFinite(sphere.radius) || sphere.radius <= 0) {
+        return null;
+      }
+      return { center: sphere.center.clone(), radius: sphere.radius, box };
+    }
+
+    function centerView() {
+      const bounds = cloudBounds();
+      if (!bounds) {
+        return;
+      }
+
+      const direction = camera.position.clone().sub(controls.target);
+      if (direction.lengthSq() < 1e-6) {
+        direction.set(0, -1, 0.45);
+      }
+      direction.normalize();
+
+      const fov = THREE.MathUtils.degToRad(camera.fov);
+      const distance = Math.max(bounds.radius / Math.sin(fov * 0.5), 0.5) * 1.25;
+      controls.target.copy(bounds.center);
+      camera.position.copy(bounds.center).addScaledVector(direction, distance);
+      camera.near = Math.max(distance / 1000, 0.001);
+      camera.far = Math.max(distance + bounds.radius * 8, 20);
+      camera.updateProjectionMatrix();
+      controls.update();
+    }
+
+    function rotateView(axis, angleRad) {
+      const bounds = cloudBounds();
+      if (bounds) {
+        controls.target.copy(bounds.center);
+      }
+      const offset = camera.position.clone().sub(controls.target);
+      const rotation = new THREE.Quaternion().setFromAxisAngle(axis.normalize(), angleRad);
+      offset.applyQuaternion(rotation);
+      camera.up.applyQuaternion(rotation).normalize();
+      camera.position.copy(controls.target).add(offset);
+      camera.lookAt(controls.target);
+      controls.update();
+    }
+
+    function rotateYaw(angleRad) {
+      rotateView(new THREE.Vector3(0, 0, 1), angleRad);
+    }
+
+    function rotatePitch(angleRad) {
+      const right = new THREE.Vector3();
+      camera.getWorldDirection(right);
+      right.cross(camera.up).normalize();
+      if (right.lengthSq() > 1e-6) {
+        rotateView(right, angleRad);
+      }
+    }
 
     function setCloud(buffer) {
       const data = new Float32Array(buffer);
@@ -125,6 +198,11 @@
       } else {
         cloud = new THREE.Points(geometry, material);
         scene.add(cloud);
+      }
+
+      if (!autoCentered) {
+        centerView();
+        autoCentered = true;
       }
 
       frames += 1;
@@ -160,6 +238,11 @@
     }
 
     document.getElementById("connect").addEventListener("click", connect);
+    document.getElementById("center").addEventListener("click", centerView);
+    document.getElementById("yaw-left").addEventListener("click", () => rotateYaw(Math.PI / 2));
+    document.getElementById("yaw-right").addEventListener("click", () => rotateYaw(-Math.PI / 2));
+    document.getElementById("pitch-up").addEventListener("click", () => rotatePitch(Math.PI / 2));
+    document.getElementById("pitch-down").addEventListener("click", () => rotatePitch(-Math.PI / 2));
 
     window.addEventListener("resize", () => {
       camera.aspect = window.innerWidth / window.innerHeight;
