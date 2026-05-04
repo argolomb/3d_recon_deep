@@ -39,9 +39,23 @@ print_every: 30
 profile_interval: 5
 cuda_empty_cache_every: 20
 
+pointcloud_web: true
+pointcloud_web_host: 0.0.0.0
+pointcloud_web_port: 8765
+pointcloud_web_every: 1
+pointcloud_web_stride: 4
+pointcloud_web_max_points: 120000
+
+
 pointcloud: true
 pointcloud_stride: 6
 pointcloud_max_depth: 30
+pointcloud_web: false
+pointcloud_web_host: 0.0.0.0
+pointcloud_web_port: 8765
+pointcloud_web_every: 1
+pointcloud_web_stride: 6
+pointcloud_web_max_points: 120000
 
 dataset_save_dir: null
 dataset_save_every: 0

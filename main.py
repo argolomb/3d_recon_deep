@@ -102,6 +102,12 @@ class RuntimeConfig:
     pointcloud_stride: int
     pointcloud_max_depth: float
     pointcloud_compute_device: str
+    pointcloud_web: bool
+    pointcloud_web_host: str
+    pointcloud_web_port: int
+    pointcloud_web_every: int
+    pointcloud_web_stride: int
+    pointcloud_web_max_points: int
     dataset_save_dir: Optional[str]
     dataset_save_every: int
     dataset_save_stride: int
@@ -256,6 +262,12 @@ def parse_args() -> RuntimeConfig:
     parser.add_argument("--pointcloud_stride", type=int, default=1, help="Point cloud pixel stride. 1 is dense, 2/4 are faster and smaller.")
     parser.add_argument("--pointcloud_max_depth", type=float, default=0.0, help="Optional max depth filter in meters for point clouds. 0 uses --max_depth.")
     parser.add_argument("--pointcloud_compute_device", choices=("auto", "cpu", "cuda"), default="auto", help="Compute depth-to-pointcloud projection on CUDA when possible.")
+    parser.add_argument("--pointcloud_web", action="store_true", help="Stream live point clouds to browser clients over WebSocket.")
+    parser.add_argument("--pointcloud_web_host", default="0.0.0.0", help="Host/interface for the point-cloud WebSocket server.")
+    parser.add_argument("--pointcloud_web_port", type=int, default=8765, help="Port for the point-cloud WebSocket server.")
+    parser.add_argument("--pointcloud_web_every", type=int, default=1, help="Publish one point cloud every N inferred frames.")
+    parser.add_argument("--pointcloud_web_stride", type=int, default=4, help="Point-cloud pixel stride used for browser streaming.")
+    parser.add_argument("--pointcloud_web_max_points", type=int, default=120000, help="Max points per browser frame. 0 disables the cap.")
     parser.add_argument("--dataset_save_dir", default=None, help="Save synchronized RGB, depth_mm, partial PLY and metadata for offline reconstruction.")
     parser.add_argument("--dataset_save_every", type=int, default=0, help="Save dataset sample every N inferred frames. 0 disables automatic saving; press d to save.")
     parser.add_argument("--dataset_save_stride", type=int, default=2, help="Point-cloud stride for dataset partial PLY.")
@@ -352,6 +364,12 @@ def parse_args() -> RuntimeConfig:
         pointcloud_stride=max(args.pointcloud_stride, 1),
         pointcloud_max_depth=max(args.pointcloud_max_depth, 0.0),
         pointcloud_compute_device=args.pointcloud_compute_device,
+        pointcloud_web=args.pointcloud_web,
+        pointcloud_web_host=args.pointcloud_web_host,
+        pointcloud_web_port=max(args.pointcloud_web_port, 1),
+        pointcloud_web_every=max(args.pointcloud_web_every, 1),
+        pointcloud_web_stride=max(args.pointcloud_web_stride, 1),
+        pointcloud_web_max_points=max(args.pointcloud_web_max_points, 0),
         dataset_save_dir=args.dataset_save_dir,
         dataset_save_every=max(args.dataset_save_every, 0),
         dataset_save_stride=max(args.dataset_save_stride, 1),
@@ -1541,6 +1559,164 @@ class PointCloudViewer:
         self.vis.destroy_window()
 
 
+class PointCloudWebSocketServer:
+    def __init__(self, host: str, port: int, max_points: int = 120000) -> None:
+        self.host = host
+        self.port = port
+        self.max_points = max_points
+        self.sock: Optional[socket.socket] = None
+        self.clients = []
+        self.clients_lock = threading.Lock()
+        self.pending_payload: Optional[bytes] = None
+        self.event = threading.Event()
+        self.stopped = False
+        self.accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self.broadcast_thread = threading.Thread(target=self._broadcast_loop, daemon=True)
+
+    def start(self) -> None:
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self.host, self.port))
+        self.sock.listen(8)
+        self.sock.settimeout(0.5)
+        self.accept_thread.start()
+        self.broadcast_thread.start()
+        actual_host, actual_port = self.sock.getsockname()[:2]
+        print(f"[pointcloud-web] ws://{actual_host}:{actual_port}")
+
+    def publish(self, points: np.ndarray, colors_rgb: np.ndarray) -> None:
+        if not self.has_clients() or points.size == 0:
+            return
+        payload = self._encode(points, colors_rgb)
+        self.pending_payload = payload
+        self.event.set()
+
+    def has_clients(self) -> bool:
+        with self.clients_lock:
+            return bool(self.clients)
+
+    def _accept_loop(self) -> None:
+        while not self.stopped:
+            try:
+                if self.sock is None:
+                    break
+                client, address = self.sock.accept()
+                client.settimeout(2.0)
+                self._handshake(client)
+                client.settimeout(0.2)
+                with self.clients_lock:
+                    self.clients.append(client)
+                print(f"\n[pointcloud-web] client connected {address[0]}:{address[1]}")
+            except socket.timeout:
+                continue
+            except Exception as exc:
+                if not self.stopped:
+                    print(f"\n[pointcloud-web] accept failed: {exc}")
+
+    def _handshake(self, client: socket.socket) -> None:
+        request = self._recv_until(client, b"\r\n\r\n", 16384).decode("iso-8859-1", errors="replace")
+        headers = {}
+        for line in request.split("\r\n")[1:]:
+            if ":" in line:
+                name, value = line.split(":", 1)
+                headers[name.strip().lower()] = value.strip()
+        key = headers.get("sec-websocket-key")
+        if not key:
+            raise ConnectionError("missing Sec-WebSocket-Key")
+        accept = base64.b64encode(hashlib.sha1((key + WebSocketImageClient.GUID).encode("ascii")).digest()).decode("ascii")
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n"
+            "\r\n"
+        )
+        client.sendall(response.encode("ascii"))
+
+    @staticmethod
+    def _recv_until(sock_obj: socket.socket, marker: bytes, max_bytes: int) -> bytes:
+        data = bytearray()
+        while marker not in data:
+            chunk = sock_obj.recv(1)
+            if not chunk:
+                raise ConnectionError("socket closed during handshake")
+            data.extend(chunk)
+            if len(data) > max_bytes:
+                raise ConnectionError("handshake request too large")
+        return bytes(data)
+
+    def _broadcast_loop(self) -> None:
+        while not self.stopped:
+            self.event.wait(timeout=0.2)
+            if self.stopped:
+                break
+            payload = self.pending_payload
+            self.pending_payload = None
+            self.event.clear()
+            if payload is None:
+                continue
+            frame = self._websocket_binary_frame(payload)
+            dead_clients = []
+            with self.clients_lock:
+                clients = list(self.clients)
+            for client in clients:
+                try:
+                    client.sendall(frame)
+                except Exception:
+                    dead_clients.append(client)
+            if dead_clients:
+                with self.clients_lock:
+                    self.clients = [client for client in self.clients if client not in dead_clients]
+                for client in dead_clients:
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
+
+    def _encode(self, points: np.ndarray, colors_rgb: np.ndarray) -> bytes:
+        if self.max_points > 0 and len(points) > self.max_points:
+            indices = np.linspace(0, len(points) - 1, self.max_points, dtype=np.int64)
+            points = points[indices]
+            colors_rgb = colors_rgb[indices]
+        colors = colors_rgb.astype(np.float32)
+        if colors.size and colors.max() > 1.0:
+            colors *= 1.0 / 255.0
+        packed = np.empty((len(points), 6), dtype=np.float32)
+        packed[:, :3] = points.astype(np.float32)
+        packed[:, 3:] = np.clip(colors, 0.0, 1.0)
+        return packed.tobytes()
+
+    @staticmethod
+    def _websocket_binary_frame(payload: bytes) -> bytes:
+        length = len(payload)
+        if length < 126:
+            header = bytes((0x82, length))
+        elif length < 65536:
+            header = bytes((0x82, 126)) + struct.pack("!H", length)
+        else:
+            header = bytes((0x82, 127)) + struct.pack("!Q", length)
+        return header + payload
+
+    def close(self) -> None:
+        self.stopped = True
+        self.event.set()
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        with self.clients_lock:
+            clients = list(self.clients)
+            self.clients = []
+        for client in clients:
+            try:
+                client.close()
+            except OSError:
+                pass
+        self.accept_thread.join(timeout=1.0)
+        self.broadcast_thread.join(timeout=1.0)
+
+
 class LiveRegistrationPreview:
     def __init__(self, cfg: RuntimeConfig) -> None:
         import open3d as o3d
@@ -1981,6 +2157,17 @@ def main() -> int:
             viewer = PointCloudViewer()
         except Exception as exc:
             print(f"[pointcloud] Open3D unavailable or viewer failed: {exc}")
+    pointcloud_web = None
+    if cfg.pointcloud_web:
+        try:
+            pointcloud_web = PointCloudWebSocketServer(
+                cfg.pointcloud_web_host,
+                cfg.pointcloud_web_port,
+                cfg.pointcloud_web_max_points,
+            )
+            pointcloud_web.start()
+        except Exception as exc:
+            print(f"[pointcloud-web] server failed: {exc}")
     registration_preview = None
     if cfg.live_registration:
         try:
@@ -2059,6 +2246,13 @@ def main() -> int:
                 if points.size:
                     viewer.update(points, colors.astype(np.float32) / 255.0)
                 timings["pointcloud"] += time.perf_counter() - t0
+            if pointcloud_web is not None and last_depth is not None and run_infer:
+                if infer_index % cfg.pointcloud_web_every == 0 and pointcloud_web.has_clients():
+                    t0 = time.perf_counter()
+                    points, colors = depth_to_pointcloud(frame_bgr, last_depth, cfg, stride=cfg.pointcloud_web_stride)
+                    if points.size:
+                        pointcloud_web.publish(points, colors)
+                    timings["pointcloud"] += time.perf_counter() - t0
             if registration_preview is not None and last_depth is not None and run_infer:
                 if infer_index % cfg.registration_every == 0:
                     registration_depth = scale_depth_for_preview(last_depth, cfg.registration_depth_scale)
@@ -2130,6 +2324,8 @@ def main() -> int:
         cv2.destroyAllWindows()
         if viewer is not None:
             viewer.close()
+        if pointcloud_web is not None:
+            pointcloud_web.close()
         if registration_preview is not None:
             registration_preview.close()
     return 0

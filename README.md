@@ -214,6 +214,41 @@ CLI arguments override YAML values:
 
 YAML values use the same names as CLI arguments without `--`.
 
+## Browser Point Cloud Streaming
+
+`main.py` can publish the live point cloud to browser clients over a separate WebSocket server:
+
+```yaml
+pointcloud_web: true
+pointcloud_web_host: 0.0.0.0
+pointcloud_web_port: 8765
+pointcloud_web_every: 1
+pointcloud_web_stride: 4
+pointcloud_web_max_points: 120000
+```
+
+Run the pipeline normally:
+
+```bash
+.venv/bin/python main.py --config config_da3_live.yaml
+```
+
+Then open `web_pointcloud_viewer.html` in a browser and connect to:
+
+```text
+ws://127.0.0.1:8765
+```
+
+For another machine on the network, replace `127.0.0.1` with the IP of the machine running `main.py`.
+
+The stream format is binary `Float32Array` data interleaved as:
+
+```text
+x, y, z, r, g, b, x, y, z, r, g, b, ...
+```
+
+Coordinates are in meters. Colors are normalized floats from `0.0` to `1.0`, ready for a Three.js `BufferGeometry` with `position` and `color` attributes.
+
 ## Live DA3 Large
 
 DA3 Large provides strong relative depth and pose estimation. It is useful for live depth preview and pose-assisted point-cloud accumulation.

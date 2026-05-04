@@ -1,5 +1,9 @@
 #ip: 192.168.15.3:8080/video
-video: VID_20260502_172226.mp4
+ip: ws://192.168.0.20:8554
+ws_media_format: mpeg1video
+ws_mpeg_format: mpegts
+
+#video: VID_20260502_172226.mp4
 model_backend: da3
 checkpoint: ./models/DA3-LARGE-1.1
 use_gpu: true
@@ -21,6 +25,12 @@ resolution_scale: 1.0
 depth_output_scale: 1.0
 da3_process_res_method: upper_bound_resize
 pointcloud_compute_device: cuda
+pointcloud_web: true
+pointcloud_web_host: 0.0.0.0
+pointcloud_web_port: 8765
+pointcloud_web_every: 1
+pointcloud_web_stride: 4
+pointcloud_web_max_points: 120000
 
 display_scale: 0.75
 display_every: 1

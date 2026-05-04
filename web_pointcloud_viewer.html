@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Point Cloud</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #101214;
+      color: #e8ecef;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    #toolbar {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      right: 12px;
+      z-index: 2;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      max-width: 760px;
+    }
+    input, button {
+      height: 34px;
+      border: 1px solid #3d464d;
+      background: #181c20;
+      color: #e8ecef;
+      border-radius: 6px;
+      padding: 0 10px;
+      font-size: 14px;
+    }
+    input {
+      flex: 1;
+      min-width: 240px;
+    }
+    button {
+      cursor: pointer;
+    }
+    #status {
+      min-width: 190px;
+      font-size: 13px;
+      color: #aab4bc;
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.164.1/build/three.module.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="toolbar">
+    <input id="url" value="ws://127.0.0.1:8765" spellcheck="false">
+    <button id="connect">Connect</button>
+    <span id="status">disconnected</span>
+  </div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "https://unpkg.com/three@0.164.1/examples/jsm/controls/OrbitControls.js";
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101214);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 200);
+    camera.position.set(0, -2.2, 1.4);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 1.2);
+    controls.enableDamping = true;
+
+    const grid = new THREE.GridHelper(10, 20, 0x3a4248, 0x252b30);
+    grid.rotation.x = Math.PI / 2;
+    scene.add(grid);
+
+    const material = new THREE.PointsMaterial({
+      size: 0.015,
+      vertexColors: true,
+      sizeAttenuation: true
+    });
+
+    let cloud = null;
+    let socket = null;
+    let frames = 0;
+    let lastFpsAt = performance.now();
+    const status = document.getElementById("status");
+    const urlInput = document.getElementById("url");
+
+    function setCloud(buffer) {
+      const data = new Float32Array(buffer);
+      const count = Math.floor(data.length / 6);
+      const positions = new Float32Array(count * 3);
+      const colors = new Float32Array(count * 3);
+
+      for (let i = 0, p = 0, c = 0; i < count; i += 1) {
+        const offset = i * 6;
+        positions[p++] = data[offset + 0];
+        positions[p++] = -data[offset + 1];
+        positions[p++] = -data[offset + 2];
+        colors[c++] = data[offset + 3];
+        colors[c++] = data[offset + 4];
+        colors[c++] = data[offset + 5];
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+      geometry.computeBoundingSphere();
+
+      if (cloud) {
+        cloud.geometry.dispose();
+        cloud.geometry = geometry;
+      } else {
+        cloud = new THREE.Points(geometry, material);
+        scene.add(cloud);
+      }
+
+      frames += 1;
+      const now = performance.now();
+      if (now - lastFpsAt > 1000) {
+        status.textContent = `connected | ${count.toLocaleString()} pts | ${frames} fps`;
+        frames = 0;
+        lastFpsAt = now;
+      }
+    }
+
+    function connect() {
+      if (socket) {
+        socket.close();
+      }
+      socket = new WebSocket(urlInput.value.trim());
+      socket.binaryType = "arraybuffer";
+      status.textContent = "connecting";
+      socket.onopen = () => {
+        status.textContent = "connected";
+      };
+      socket.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          setCloud(event.data);
+        }
+      };
+      socket.onclose = () => {
+        status.textContent = "disconnected";
+      };
+      socket.onerror = () => {
+        status.textContent = "socket error";
+      };
+    }
+
+    document.getElementById("connect").addEventListener("click", connect);
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    function animate() {
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+
+    animate();
+  </script>
+</body>
+</html>
