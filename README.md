@@ -186,7 +186,17 @@ or in YAML:
 ip: ws://192.168.15.2:8765/video
 ```
 
-The WebSocket server should send each RGB frame as a JPEG/PNG image or MP4 video. Supported payloads are binary JPEG/PNG/MP4 frames, text base64, data URLs such as `data:image/jpeg;base64,...` or `data:video/mp4;base64,...`, or JSON text with an `image`, `frame`, or `data` field containing base64 image/video data. For MP4 videos, the first frame will be extracted.
+The default WebSocket mode expects each RGB frame as a JPEG/PNG image. It also accepts complete MP4 payloads and extracts the first frame, but this is not recommended for low-latency live use. Supported payloads are binary JPEG/PNG/MP4 frames, text base64, data URLs such as `data:image/jpeg;base64,...` or `data:video/mp4;base64,...`, or JSON text with an `image`, `frame`, `video`, or `data` field containing base64 image/video data.
+
+For a continuous MPEG-1 stream, enable the MPEG-1 WebSocket decoder:
+
+```yaml
+ip: ws://192.168.15.2:8765/video
+ws_media_format: mpeg1video
+ws_mpeg_format: mpegvideo   # raw MPEG-1 elementary stream
+```
+
+This mode requires `ffmpeg` available in `PATH`. If your server sends MPEG-TS containing MPEG-1 video, use `ws_mpeg_format: mpegts`; for a raw `mpeg1video` elementary stream, keep `mpegvideo`.
 
 ## YAML Configuration
 

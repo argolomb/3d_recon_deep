@@ -33,6 +33,7 @@ import os
 import socket
 import ssl
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -56,6 +57,8 @@ class RuntimeConfig:
     realtime_video: bool
     port: int
     stream_path: str
+    ws_media_format: str
+    ws_mpeg_format: str
     use_gpu: bool
     checkpoint: Optional[str]
     repo_path: Optional[str]
@@ -203,6 +206,8 @@ def parse_args() -> RuntimeConfig:
     parser.add_argument("--realtime_video", action="store_true", help="Throttle local video playback to the file FPS.")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--stream_path", default="/video")
+    parser.add_argument("--ws_media_format", choices=("image", "mpeg1video"), default="image", help="WebSocket payload format. image expects JPEG/PNG/MP4 messages; mpeg1video expects a continuous MPEG-1 stream.")
+    parser.add_argument("--ws_mpeg_format", choices=("auto", "mpegts", "mpegvideo"), default="mpegvideo", help="Container/bitstream hint for --ws_media_format mpeg1video. Use mpegvideo for raw MPEG-1 video, mpegts for JSMpeg/ffmpeg MPEG-TS.")
     parser.add_argument("--use_gpu", action="store_true", help="Use CUDA if available.")
     parser.add_argument("--checkpoint", default=None, help="Metric checkpoint path, local model dir, or Hugging Face model id for --model_backend da3.")
     parser.add_argument("--repo_path", default=None, help="Path to official Depth-Anything metric_depth repo or Depth-Anything-V2 repo.")
@@ -302,6 +307,8 @@ def parse_args() -> RuntimeConfig:
         realtime_video=args.realtime_video,
         port=args.port,
         stream_path=args.stream_path,
+        ws_media_format=args.ws_media_format,
+        ws_mpeg_format=args.ws_mpeg_format,
         use_gpu=args.use_gpu,
         checkpoint=args.checkpoint,
         repo_path=args.repo_path,
@@ -624,7 +631,7 @@ class WebSocketImageClient:
         masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
         self.sock.sendall(header + mask + masked)
 
-    def recv_image(self) -> np.ndarray:
+    def recv_message(self) -> Tuple[bytes, int]:
         fragments = []
         first_opcode = None
         while True:
@@ -660,26 +667,32 @@ class WebSocketImageClient:
                 continue
 
             if fin:
-                return decode_websocket_image(b"".join(fragments), first_opcode)
+                return b"".join(fragments), first_opcode
+
+    def recv_image(self) -> np.ndarray:
+        payload, opcode = self.recv_message()
+        return decode_websocket_image(payload, opcode)
+
+
+def decode_websocket_text_payload(payload: bytes) -> bytes:
+    text = payload.decode("utf-8", errors="ignore").strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            for key in ("image", "frame", "data", "video"):
+                if key in data:
+                    text = str(data[key]).strip()
+                    break
+        except json.JSONDecodeError:
+            pass
+    if "," in text and text.lower().startswith(("data:image", "data:video")):
+        text = text.split(",", 1)[1]
+    return base64.b64decode(text, validate=False)
 
 
 def decode_websocket_image(payload: bytes, opcode: int) -> np.ndarray:
     if opcode == 1:
-        text = payload.decode("utf-8", errors="ignore").strip()
-        if text.startswith("{"):
-            try:
-                data = json.loads(text)
-                for key in ("image", "frame", "data"):
-                    if key in data:
-                        text = str(data[key]).strip()
-                        break
-            except json.JSONDecodeError:
-                pass
-        if "," in text and text.lower().startswith("data:image"):
-            text = text.split(",", 1)[1]
-        if "," in text and text.lower().startswith("data:video"):
-            text = text.split(",", 1)[1]
-        payload = base64.b64decode(text, validate=False)
+        payload = decode_websocket_text_payload(payload)
 
     image_bytes = np.frombuffer(payload, dtype=np.uint8)
     frame_bgr = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
@@ -707,6 +720,119 @@ def decode_websocket_image(payload: bytes, opcode: int) -> np.ndarray:
     raise ValueError("WebSocket payload is not a valid JPEG/PNG/MP4 media")
 
 
+class FfmpegMpeg1Decoder:
+    def __init__(self, cfg: RuntimeConfig, on_frame) -> None:
+        self.cfg = cfg
+        self.on_frame = on_frame
+        self.proc: Optional[subprocess.Popen] = None
+        self.thread: Optional[threading.Thread] = None
+        self.stopped = False
+
+    def start(self) -> None:
+        if self.proc is not None:
+            return
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-flags",
+            "low_delay",
+            "-probesize",
+            "32768",
+            "-analyzeduration",
+            "0",
+        ]
+        if self.cfg.ws_mpeg_format != "auto":
+            command.extend(["-f", self.cfg.ws_mpeg_format])
+        command.extend(
+            [
+                "-i",
+                "pipe:0",
+                "-an",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "mjpeg",
+                "-q:v",
+                "5",
+                "pipe:1",
+            ]
+        )
+        try:
+            self.proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("ffmpeg is required for ws_media_format=mpeg1video") from exc
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def feed(self, payload: bytes) -> None:
+        if self.proc is None or self.proc.stdin is None:
+            self.start()
+        if self.proc is None or self.proc.stdin is None:
+            return
+        try:
+            self.proc.stdin.write(payload)
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise ConnectionError("ffmpeg decoder stopped accepting MPEG-1 data") from exc
+
+    def _reader(self) -> None:
+        if self.proc is None or self.proc.stdout is None:
+            return
+        buffer = bytearray()
+        while not self.stopped:
+            chunk = self.proc.stdout.read(4096)
+            if not chunk:
+                if self.proc.poll() is not None:
+                    break
+                time.sleep(0.001)
+                continue
+            buffer.extend(chunk)
+            while True:
+                start = buffer.find(b"\xff\xd8")
+                if start < 0:
+                    if len(buffer) > 2:
+                        del buffer[:-2]
+                    break
+                end = buffer.find(b"\xff\xd9", start + 2)
+                if end < 0:
+                    if start > 0:
+                        del buffer[:start]
+                    break
+                jpeg = bytes(buffer[start : end + 2])
+                del buffer[: end + 2]
+                frame_bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame_bgr is not None:
+                    self.on_frame(frame_bgr)
+
+    def close(self) -> None:
+        self.stopped = True
+        if self.proc is not None:
+            try:
+                if self.proc.stdin is not None:
+                    self.proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+        self.proc = None
+
+
 class WebSocketFrameStream:
     def __init__(self, cfg: RuntimeConfig) -> None:
         self.cfg = cfg
@@ -715,8 +841,20 @@ class WebSocketFrameStream:
         self.frame = None
         self.stopped = False
         self.client: Optional[WebSocketImageClient] = None
+        self.decoder: Optional[FfmpegMpeg1Decoder] = None
+        if cfg.ws_media_format == "mpeg1video":
+            self.decoder = FfmpegMpeg1Decoder(cfg, self._set_decoded_frame)
         self.thread = threading.Thread(target=self._reader, daemon=True)
         self.thread.start()
+
+    def _set_decoded_frame(self, frame_bgr: np.ndarray) -> None:
+        try:
+            frame_bgr = preprocess_frame(frame_bgr, self.cfg)
+        except Exception as exc:
+            print(f"[ws] decoded frame preprocessing failed: {exc}")
+            return
+        with self.lock:
+            self.frame = frame_bgr
 
     def _reader(self) -> None:
         min_dt = 1.0 / self.cfg.capture_fps if self.cfg.capture_fps > 0 else 0.0
@@ -728,10 +866,16 @@ class WebSocketFrameStream:
                     self.client.connect()
                     print("[ws] connected")
                 start = time.perf_counter()
-                frame_bgr = self.client.recv_image()
-                frame_bgr = preprocess_frame(frame_bgr, self.cfg)
-                with self.lock:
-                    self.frame = frame_bgr
+                if self.decoder is not None:
+                    payload, opcode = self.client.recv_message()
+                    if opcode == 1:
+                        payload = decode_websocket_text_payload(payload)
+                    self.decoder.feed(payload)
+                else:
+                    frame_bgr = self.client.recv_image()
+                    frame_bgr = preprocess_frame(frame_bgr, self.cfg)
+                    with self.lock:
+                        self.frame = frame_bgr
                 if min_dt > 0:
                     elapsed = time.perf_counter() - start
                     if elapsed < min_dt:
@@ -742,6 +886,9 @@ class WebSocketFrameStream:
                     if self.client is not None:
                         self.client.close()
                         self.client = None
+                    if self.decoder is not None:
+                        self.decoder.close()
+                        self.decoder = FfmpegMpeg1Decoder(self.cfg, self._set_decoded_frame)
                     time.sleep(self.cfg.reconnect_delay)
 
     def read(self) -> Optional[np.ndarray]:
@@ -754,6 +901,8 @@ class WebSocketFrameStream:
         self.stopped = True
         if self.client is not None:
             self.client.close()
+        if self.decoder is not None:
+            self.decoder.close()
         self.thread.join(timeout=1.0)
 
 

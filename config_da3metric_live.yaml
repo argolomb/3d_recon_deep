@@ -1,5 +1,11 @@
-ip: 192.168.15.3:8080/video
+#ip: ws://192.168.0.20:8554
 #video: VID_20260502_172226.mp4
+
+ip: ws://192.168.0.20:8554
+ws_media_format: mpeg1video
+ws_mpeg_format: mpegts
+
+
 
 model_backend: da3
 checkpoint: ./models/DA3METRIC-LARGE
@@ -17,7 +23,7 @@ sharpen: 0.35
 denoise: 3
 low_latency: true
 
-input_size: 384
+input_size: 192
 resolution_scale: 1.0
 depth_output_scale: 1.0
 da3_process_res_method: upper_bound_resize
