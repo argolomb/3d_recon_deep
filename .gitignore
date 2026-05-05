@@ -22,7 +22,7 @@ env/
 Thumbs.db
 
 # Large model/checkpoint files and downloaded model snapshots
-models/
+models/DA3*
 model/
 *.pth
 *.pt
