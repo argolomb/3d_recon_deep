@@ -32,8 +32,9 @@ model/
 
 # External repositories cloned locally
 Depth-Anything-V2/
-depth-anything-3/
 TEASER-plusplus/
+nerf_dataset/
+gaussian_splatting/
 
 # Input recordings and archives
 *.mp4
