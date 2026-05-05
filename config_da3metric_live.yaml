@@ -1,9 +1,12 @@
 #ip: ws://192.168.0.20:8554
 #video: VID_20260502_172226.mp4
+#video: VID_20260502_172226.mp4
 
+ip: ws://127.0.0.1:8765
 ip: ws://127.0.0.1:8765
 ws_media_format: mpeg1video
 ws_mpeg_format: mpegts
+ws_decoder_queue: 2
 
 
 
@@ -31,6 +34,7 @@ da3_metric_focal_scale: false
 da3_metric_scale: 1.0
 pointcloud_compute_device: cuda
 
+display_window: false
 display_scale: 0.75
 display_every: 1
 fast_vis: false
@@ -39,23 +43,19 @@ print_every: 30
 profile_interval: 5
 cuda_empty_cache_every: 20
 
-pointcloud_web: true
-pointcloud_web_host: 0.0.0.0
-pointcloud_web_port: 8764
-pointcloud_web_every: 1
-pointcloud_web_stride: 4
-pointcloud_web_max_points: 120000
-
-
 pointcloud: true
+pointcloud_viewer: false
 pointcloud_stride: 6
 pointcloud_max_depth: 30
-pointcloud_web: false
+
+pointcloud_web: true
+pointcloud_web_background: true
 pointcloud_web_host: 0.0.0.0
+pointcloud_web_port: 8764
 pointcloud_web_port: 8764
 pointcloud_web_every: 1
 pointcloud_web_stride: 6
-pointcloud_web_max_points: 120000
+pointcloud_web_max_points: 30000
 
 dataset_save_dir: null
 dataset_save_every: 0

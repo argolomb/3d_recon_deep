@@ -38,9 +38,10 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Deque, Optional, Tuple
 from urllib.parse import urlparse
 
 import cv2
@@ -59,6 +60,7 @@ class RuntimeConfig:
     stream_path: str
     ws_media_format: str
     ws_mpeg_format: str
+    ws_decoder_queue: int
     use_gpu: bool
     checkpoint: Optional[str]
     repo_path: Optional[str]
@@ -81,6 +83,7 @@ class RuntimeConfig:
     height: int
     frame_skip: int
     fps_limit: float
+    display_window: bool
     display_scale: float
     display_every: int
     print_every: int
@@ -102,12 +105,14 @@ class RuntimeConfig:
     pointcloud_stride: int
     pointcloud_max_depth: float
     pointcloud_compute_device: str
+    pointcloud_viewer: bool
     pointcloud_web: bool
     pointcloud_web_host: str
     pointcloud_web_port: int
     pointcloud_web_every: int
     pointcloud_web_stride: int
     pointcloud_web_max_points: int
+    pointcloud_web_background: bool
     dataset_save_dir: Optional[str]
     dataset_save_every: int
     dataset_save_stride: int
@@ -203,6 +208,12 @@ def add_config_argument(parser: argparse.ArgumentParser) -> Optional[str]:
     return known.config
 
 
+def parse_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in ("1", "true", "yes", "on")
+
+
 def parse_args() -> RuntimeConfig:
     parser = argparse.ArgumentParser(description="Real-time metric depth with Depth Anything and Android IP Webcam.")
     config_path = add_config_argument(parser)
@@ -214,6 +225,7 @@ def parse_args() -> RuntimeConfig:
     parser.add_argument("--stream_path", default="/video")
     parser.add_argument("--ws_media_format", choices=("image", "mpeg1video"), default="image", help="WebSocket payload format. image expects JPEG/PNG/MP4 messages; mpeg1video expects a continuous MPEG-1 stream.")
     parser.add_argument("--ws_mpeg_format", choices=("auto", "mpegts", "mpegvideo"), default="mpegvideo", help="Container/bitstream hint for --ws_media_format mpeg1video. Use mpegvideo for raw MPEG-1 video, mpegts for JSMpeg/ffmpeg MPEG-TS.")
+    parser.add_argument("--ws_decoder_queue", type=int, default=2, help="Max queued MPEG websocket payloads before dropping old data. Lower keeps RTMP/WebSocket live at the cost of frame drops.")
     parser.add_argument("--use_gpu", action="store_true", help="Use CUDA if available.")
     parser.add_argument("--checkpoint", default=None, help="Metric checkpoint path, local model dir, or Hugging Face model id for --model_backend da3.")
     parser.add_argument("--repo_path", default=None, help="Path to official Depth-Anything metric_depth repo or Depth-Anything-V2 repo.")
@@ -241,6 +253,7 @@ def parse_args() -> RuntimeConfig:
     parser.add_argument("--height", type=int, default=0, help="Requested stream height; 0 keeps camera default.")
     parser.add_argument("--frame_skip", type=int, default=0, help="Run inference every N+1 frames; reuse previous depth between runs.")
     parser.add_argument("--fps_limit", type=float, default=30.0)
+    parser.add_argument("--display_window", type=parse_bool, default=True, help="Render the OpenCV RGB/depth window. Set false for headless/background runs.")
     parser.add_argument("--display_scale", type=float, default=1.0, help="Scale only the OpenCV visualization. Values like 0.5 reduce CPU display cost.")
     parser.add_argument("--display_every", type=int, default=1, help="Render the OpenCV window every N frames.")
     parser.add_argument("--print_every", type=int, default=15, help="Print FPS every N frames instead of every frame.")
@@ -254,7 +267,8 @@ def parse_args() -> RuntimeConfig:
     parser.add_argument("--low_latency", action="store_true", help="Read camera frames in a background thread and always process the newest frame.")
     parser.add_argument("--capture_fps", type=float, default=0.0, help="Optional sleep limit for threaded capture. 0 reads as fast as possible.")
     parser.add_argument("--depth_output_scale", type=float, default=1.0, help="Scale metric depth output before CPU transfer. 0.5 is faster but saves lower-res depth.")
-    parser.add_argument("--pointcloud", action="store_true", help="Open optional Open3D point-cloud viewer.")
+    parser.add_argument("--pointcloud", action="store_true", help="Enable point-cloud generation for viewer, saving, or streaming.")
+    parser.add_argument("--pointcloud_viewer", type=parse_bool, default=True, help="Open the Open3D point-cloud viewer when --pointcloud is set.")
     parser.add_argument("--save_dir", default=None, help="If set, save synchronized RGB and uint16 depth PNG files.")
     parser.add_argument("--save_every", type=int, default=0, help="Save every N inferred frames. 0 disables automatic saving; press s to save.")
     parser.add_argument("--pointcloud_save_dir", default=None, help="If set, save dense colored PLY point clouds. Press p to save current point cloud.")
@@ -268,6 +282,7 @@ def parse_args() -> RuntimeConfig:
     parser.add_argument("--pointcloud_web_every", type=int, default=1, help="Publish one point cloud every N inferred frames.")
     parser.add_argument("--pointcloud_web_stride", type=int, default=4, help="Point-cloud pixel stride used for browser streaming.")
     parser.add_argument("--pointcloud_web_max_points", type=int, default=120000, help="Max points per browser frame. 0 disables the cap.")
+    parser.add_argument("--pointcloud_web_background", action="store_true", help="Compute websocket point clouds in a background thread using the latest inferred frame.")
     parser.add_argument("--dataset_save_dir", default=None, help="Save synchronized RGB, depth_mm, partial PLY and metadata for offline reconstruction.")
     parser.add_argument("--dataset_save_every", type=int, default=0, help="Save dataset sample every N inferred frames. 0 disables automatic saving; press d to save.")
     parser.add_argument("--dataset_save_stride", type=int, default=2, help="Point-cloud stride for dataset partial PLY.")
@@ -321,6 +336,7 @@ def parse_args() -> RuntimeConfig:
         stream_path=args.stream_path,
         ws_media_format=args.ws_media_format,
         ws_mpeg_format=args.ws_mpeg_format,
+        ws_decoder_queue=max(args.ws_decoder_queue, 1),
         use_gpu=args.use_gpu,
         checkpoint=args.checkpoint,
         repo_path=args.repo_path,
@@ -343,6 +359,7 @@ def parse_args() -> RuntimeConfig:
         height=args.height,
         frame_skip=max(args.frame_skip, 0),
         fps_limit=max(args.fps_limit, 0.0),
+        display_window=args.display_window,
         display_scale=max(args.display_scale, 0.1),
         display_every=max(args.display_every, 1),
         print_every=max(args.print_every, 1),
@@ -364,12 +381,14 @@ def parse_args() -> RuntimeConfig:
         pointcloud_stride=max(args.pointcloud_stride, 1),
         pointcloud_max_depth=max(args.pointcloud_max_depth, 0.0),
         pointcloud_compute_device=args.pointcloud_compute_device,
+        pointcloud_viewer=args.pointcloud_viewer,
         pointcloud_web=args.pointcloud_web,
         pointcloud_web_host=args.pointcloud_web_host,
         pointcloud_web_port=max(args.pointcloud_web_port, 1),
         pointcloud_web_every=max(args.pointcloud_web_every, 1),
         pointcloud_web_stride=max(args.pointcloud_web_stride, 1),
         pointcloud_web_max_points=max(args.pointcloud_web_max_points, 0),
+        pointcloud_web_background=args.pointcloud_web_background,
         dataset_save_dir=args.dataset_save_dir,
         dataset_save_every=max(args.dataset_save_every, 0),
         dataset_save_stride=max(args.dataset_save_stride, 1),
@@ -743,7 +762,11 @@ class FfmpegMpeg1Decoder:
         self.cfg = cfg
         self.on_frame = on_frame
         self.proc: Optional[subprocess.Popen] = None
-        self.thread: Optional[threading.Thread] = None
+        self.reader_thread: Optional[threading.Thread] = None
+        self.writer_thread: Optional[threading.Thread] = None
+        self.queue: Deque[bytes] = deque()
+        self.queue_lock = threading.Lock()
+        self.queue_event = threading.Event()
         self.stopped = False
 
     def start(self) -> None:
@@ -756,8 +779,12 @@ class FfmpegMpeg1Decoder:
             "error",
             "-flags",
             "low_delay",
+            "-fflags",
+            "nobuffer",
+            "-avioflags",
+            "direct",
             "-probesize",
-            "32768",
+            "8192",
             "-analyzeduration",
             "0",
         ]
@@ -768,6 +795,8 @@ class FfmpegMpeg1Decoder:
                 "-i",
                 "pipe:0",
                 "-an",
+                "-flush_packets",
+                "1",
                 "-f",
                 "image2pipe",
                 "-vcodec",
@@ -787,19 +816,56 @@ class FfmpegMpeg1Decoder:
             )
         except FileNotFoundError as exc:
             raise RuntimeError("ffmpeg is required for ws_media_format=mpeg1video") from exc
-        self.thread = threading.Thread(target=self._reader, daemon=True)
-        self.thread.start()
+        self.reader_thread = threading.Thread(target=self._reader, daemon=True)
+        self.writer_thread = threading.Thread(target=self._writer, daemon=True)
+        self.reader_thread.start()
+        self.writer_thread.start()
 
     def feed(self, payload: bytes) -> None:
-        if self.proc is None or self.proc.stdin is None:
+        if self.proc is None:
             self.start()
-        if self.proc is None or self.proc.stdin is None:
+        if self.proc is None:
             return
+        with self.queue_lock:
+            self.queue.append(payload)
+            while len(self.queue) > self.cfg.ws_decoder_queue:
+                self.queue.popleft()
+        self.queue_event.set()
+
+    def _writer(self) -> None:
+        while not self.stopped:
+            self.queue_event.wait(timeout=0.2)
+            if self.stopped:
+                break
+            with self.queue_lock:
+                payload = self.queue.popleft() if self.queue else None
+                if not self.queue:
+                    self.queue_event.clear()
+            if payload is None:
+                continue
+            if self.proc is None or self.proc.stdin is None:
+                break
+            try:
+                self.proc.stdin.write(payload)
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                if not self.stopped:
+                    print(f"\n[ffmpeg] decoder stopped accepting MPEG data: {exc}")
+                break
+
+    def is_alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _raise_if_stopped(self) -> None:
+        if self.proc is not None and self.proc.poll() is not None:
+            raise ConnectionError("ffmpeg decoder stopped")
+
+    def feed_or_raise(self, payload: bytes) -> None:
+        self.feed(payload)
         try:
-            self.proc.stdin.write(payload)
-            self.proc.stdin.flush()
-        except (BrokenPipeError, OSError) as exc:
-            raise ConnectionError("ffmpeg decoder stopped accepting MPEG-1 data") from exc
+            self._raise_if_stopped()
+        except ConnectionError:
+            raise
 
     def _reader(self) -> None:
         if self.proc is None or self.proc.stdout is None:
@@ -832,6 +898,7 @@ class FfmpegMpeg1Decoder:
 
     def close(self) -> None:
         self.stopped = True
+        self.queue_event.set()
         if self.proc is not None:
             try:
                 if self.proc.stdin is not None:
@@ -846,8 +913,10 @@ class FfmpegMpeg1Decoder:
                     self.proc.kill()
                 except Exception:
                     pass
-        if self.thread is not None:
-            self.thread.join(timeout=1.0)
+        if self.writer_thread is not None:
+            self.writer_thread.join(timeout=1.0)
+        if self.reader_thread is not None:
+            self.reader_thread.join(timeout=1.0)
         self.proc = None
 
 
@@ -888,7 +957,7 @@ class WebSocketFrameStream:
                     payload, opcode = self.client.recv_message()
                     if opcode == 1:
                         payload = decode_websocket_text_payload(payload)
-                    self.decoder.feed(payload)
+                    self.decoder.feed_or_raise(payload)
                 else:
                     frame_bgr = self.client.recv_image()
                     frame_bgr = preprocess_frame(frame_bgr, self.cfg)
@@ -1496,13 +1565,11 @@ def save_dataset_sample(
     cv2.imwrite(str(rgb_path), frame_bgr)
     cv2.imwrite(str(depth_path), depth_mm)
 
-    original_max_depth = cfg.pointcloud_max_depth
+    pointcloud_cfg = cfg
     if cfg.dataset_save_max_depth > 0.0:
-        cfg.pointcloud_max_depth = cfg.dataset_save_max_depth
-    try:
-        points, colors = depth_to_pointcloud(frame_bgr, depth_m, cfg, stride=cfg.dataset_save_stride)
-    finally:
-        cfg.pointcloud_max_depth = original_max_depth
+        pointcloud_cfg = copy.copy(cfg)
+        pointcloud_cfg.pointcloud_max_depth = cfg.dataset_save_max_depth
+    points, colors = depth_to_pointcloud(frame_bgr, depth_m, pointcloud_cfg, stride=cfg.dataset_save_stride)
     write_pointcloud_ply(points, colors, ply_path)
 
     fx, fy, cx, cy = camera_intrinsics(frame_bgr.shape[1], frame_bgr.shape[0], cfg)
@@ -1715,6 +1782,55 @@ class PointCloudWebSocketServer:
                 pass
         self.accept_thread.join(timeout=1.0)
         self.broadcast_thread.join(timeout=1.0)
+
+
+class BackgroundPointCloudWebPublisher:
+    def __init__(self, server: PointCloudWebSocketServer, cfg: RuntimeConfig) -> None:
+        self.server = server
+        self.cfg = cfg
+        self.lock = threading.Lock()
+        self.event = threading.Event()
+        self.pending: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self.stopped = False
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def submit(self, frame_bgr: np.ndarray, depth_m: np.ndarray) -> None:
+        if not self.server.has_clients():
+            return
+        with self.lock:
+            self.pending = (frame_bgr.copy(), depth_m.copy())
+        self.event.set()
+
+    def _loop(self) -> None:
+        last_error = 0.0
+        while not self.stopped:
+            self.event.wait(timeout=0.2)
+            if self.stopped:
+                break
+            with self.lock:
+                item = self.pending
+                self.pending = None
+                self.event.clear()
+            if item is None or not self.server.has_clients():
+                continue
+            frame_bgr, depth_m = item
+            try:
+                points, colors = depth_to_pointcloud(frame_bgr, depth_m, self.cfg, stride=self.cfg.pointcloud_web_stride)
+                if points.size:
+                    self.server.publish(points, colors)
+            except Exception as exc:
+                now = time.perf_counter()
+                if now - last_error > 2.0:
+                    print(f"\n[pointcloud-web] background publish failed: {exc}")
+                    last_error = now
+
+    def close(self) -> None:
+        self.stopped = True
+        self.event.set()
+        self.thread.join(timeout=1.0)
 
 
 class LiveRegistrationPreview:
@@ -2150,14 +2266,18 @@ def main() -> int:
     else:
         stream = None
     video_fps = cap.get(cv2.CAP_PROP_FPS) if cap is not None and cfg.video else 0.0
-    create_display_window(cfg)
+    if cfg.display_window:
+        create_display_window(cfg)
     viewer = None
-    if cfg.pointcloud:
+    if cfg.pointcloud and cfg.pointcloud_viewer:
         try:
             viewer = PointCloudViewer()
         except Exception as exc:
             print(f"[pointcloud] Open3D unavailable or viewer failed: {exc}")
+    elif cfg.pointcloud and not cfg.pointcloud_viewer:
+        print("[pointcloud] viewer disabled; point clouds can still be saved or streamed")
     pointcloud_web = None
+    pointcloud_web_publisher = None
     if cfg.pointcloud_web:
         try:
             pointcloud_web = PointCloudWebSocketServer(
@@ -2166,8 +2286,14 @@ def main() -> int:
                 cfg.pointcloud_web_max_points,
             )
             pointcloud_web.start()
+            if cfg.pointcloud_web_background:
+                pointcloud_web_publisher = BackgroundPointCloudWebPublisher(pointcloud_web, cfg)
+                pointcloud_web_publisher.start()
+                print("[pointcloud-web] background point-cloud generation enabled")
         except Exception as exc:
             print(f"[pointcloud-web] server failed: {exc}")
+            pointcloud_web = None
+            pointcloud_web_publisher = None
     registration_preview = None
     if cfg.live_registration:
         try:
@@ -2233,7 +2359,7 @@ def main() -> int:
                         last_infer_error = now
 
             fps = fps_meter.tick()
-            if frame_index % cfg.display_every == 0:
+            if cfg.display_window and frame_index % cfg.display_every == 0:
                 t0 = time.perf_counter()
                 visualize(frame_bgr, last_depth, fps, cfg)
                 timings["visualize"] += time.perf_counter() - t0
@@ -2248,11 +2374,14 @@ def main() -> int:
                 timings["pointcloud"] += time.perf_counter() - t0
             if pointcloud_web is not None and last_depth is not None and run_infer:
                 if infer_index % cfg.pointcloud_web_every == 0 and pointcloud_web.has_clients():
-                    t0 = time.perf_counter()
-                    points, colors = depth_to_pointcloud(frame_bgr, last_depth, cfg, stride=cfg.pointcloud_web_stride)
-                    if points.size:
-                        pointcloud_web.publish(points, colors)
-                    timings["pointcloud"] += time.perf_counter() - t0
+                    if pointcloud_web_publisher is not None:
+                        pointcloud_web_publisher.submit(frame_bgr, last_depth)
+                    else:
+                        t0 = time.perf_counter()
+                        points, colors = depth_to_pointcloud(frame_bgr, last_depth, cfg, stride=cfg.pointcloud_web_stride)
+                        if points.size:
+                            pointcloud_web.publish(points, colors)
+                        timings["pointcloud"] += time.perf_counter() - t0
             if registration_preview is not None and last_depth is not None and run_infer:
                 if infer_index % cfg.registration_every == 0:
                     registration_depth = scale_depth_for_preview(last_depth, cfg.registration_depth_scale)
@@ -2261,7 +2390,7 @@ def main() -> int:
             if registration_preview is not None:
                 registration_preview.poll()
 
-            key = cv2.waitKey(1) & 0xFF
+            key = cv2.waitKey(1) & 0xFF if cfg.display_window else 255
             if key in (27, ord("q")):
                 break
             if key == ord("s") and cfg.save_dir and last_depth is not None:
@@ -2321,9 +2450,12 @@ def main() -> int:
             stream.release()
         if cap is not None:
             cap.release()
-        cv2.destroyAllWindows()
+        if cfg.display_window:
+            cv2.destroyAllWindows()
         if viewer is not None:
             viewer.close()
+        if pointcloud_web_publisher is not None:
+            pointcloud_web_publisher.close()
         if pointcloud_web is not None:
             pointcloud_web.close()
         if registration_preview is not None:
