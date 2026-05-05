@@ -1,7 +1,7 @@
 #ip: ws://192.168.0.20:8554
-#video: VID_20260502_172226.mp4
+video: VID_20260502_172226.mp4
 
-ip: ws://192.168.0.20:8554
+#ip: ws://192.168.0.20:8554
 ws_media_format: mpeg1video
 ws_mpeg_format: mpegts
 
